@@ -446,15 +446,38 @@ class TestReopen:
                 assert s["frozen_reason"] == "REOPEN_MISMATCH"
                 assert s["version_no"] == 2          # 版本号未递增
                 assert s["frozen_detail"]["mismatch_count"] >= 1
-            # request_key 未消费：冲突消除后同键可重开成功
+            # request_key 已被终局拒绝：修复后同键重放仍回放首次拒绝
+            with pytest.raises(ss.ReplayedDecision) as er:
+                with tx() as conn:
+                    ss.reopen(conn, pid, {"request_key": "k-r", "version": 2,
+                                          "actor": "alice", "ttl_minutes": 30})
+            assert er.value.payload["replayed"] is True
+            assert er.value.payload["code"] == "REOPEN_MISMATCH"
+            # 回放的是首次判定时的快照（仍带着失配明细）
+            assert any(x["id"] == vitem["id"] and
+                       x["detail"]["local_hash"] == "TAMPERED-LOCAL-HASH"
+                       for x in er.value.payload["conflicts"])
+            # 即使携带（会话被推进后的）新版本号，原操作标识依旧回放拒绝
+            with pytest.raises(ss.ReplayedDecision):
+                with tx() as conn:
+                    ss.reopen(conn, pid, {"request_key": "k-r", "version": 99,
+                                          "actor": "alice", "ttl_minutes": 30})
+            # 消除冲突：必须用**新 request_key + 当前版本号**才能再次校验通过
             with tx() as conn:
                 conn.execute("DELETE FROM parcel_version WHERE id=?",
                              (vitem["id"],))
                 conn.execute("DELETE FROM parcel WHERE id=?",
                              (vitem["parcel_id"],))
-                r = ss.reopen(conn, pid, {"request_key": "k-r", "version": 2,
+                r = ss.reopen(conn, pid, {"request_key": "k-r2", "version": 2,
                                           "actor": "alice", "ttl_minutes": 30})
             assert r["status"] in ("UPLOADING", "READY")
+            assert r["version"] == 3
+            # 重放未重复落审计：REOPEN_REJECTED 只在首次拒绝时记一条
+            with tx() as conn:
+                evs = ss.list_events(conn, pid)
+            assert sum(1 for e in evs if e["action"] == "REOPEN_REJECTED") == 1
+            assert sum(1 for e in evs if e["action"] == "FREEZE"
+                       and e["detail"].get("reason") == "REOPEN_MISMATCH") == 1
 
     def test_reopen_tampered_manifest_fails(self):
         pkg = make_pkg()
@@ -486,6 +509,255 @@ class TestReopen:
             r2 = ss.reopen(conn, pid, body)
         assert r1["version"] == r2["version"] == 2
         assert r2["replayed"] is True
+
+
+# ================================================================ 重开拒绝的请求去重（终局判定）
+class TestReopenDecisionIdempotency:
+    """一次重开校验被拒后，操作标识（request_key）永久对应首次拒绝响应。
+
+    场景：磁盘分块损坏（或接收库分叉）导致 reopen 重验失败 → 会话保持冻结；
+    后台修复后，原 request_key 的连续点击/网络重试只回放首次拒绝，必须用
+    新 request_key + 最新会话版本号才能再次校验；会话已导入后同样不可恢复。
+    """
+
+    @contextlib.contextmanager
+    def _frozen_ready_with_corrupt_chunk(self, *, corrupt=True):
+        """全块齐备 → 人工冻结 → 直接破坏磁盘上的分块 1（模拟磁盘损坏）。
+
+        在独立的"接收方"库内完成，yield (pkg, pid, raws)。
+        """
+        pkg = make_pkg()
+        m = pkg["manifest"]
+        raws = raws_of(pkg)
+        assert m["chunk_count"] >= 2
+        pid = m["package_id"]
+        with receiver_db():
+            with tx() as conn:
+                ss.create_import(conn, m, "recv", owner="alice",
+                                 ttl_minutes=120, as_of=T0)
+            for seq, raw in enumerate(raws):
+                with tx() as conn:
+                    ss.put_chunk(conn, pid, seq, raw, actor="alice", as_of=T0)
+            with tx() as conn:
+                ss.manual_freeze(conn, pid, {"request_key": "k-f", "version": 1,
+                                             "actor": "alice"})
+            if corrupt:
+                with tx() as conn:
+                    conn.execute(
+                        "UPDATE snapshot_chunk SET content=?,sha256=? "
+                        "WHERE package_id=? AND seq=1",
+                        (b"CORRUPT-BYTES-ON-DISK",
+                         ss.sha256_hex(b"CORRUPT-BYTES-ON-DISK"), pid))
+            yield pkg, pid, raws
+
+    def _repair_chunk(self, pid, raws, seq=1):
+        """后台修复磁盘上的损坏分块（不经过会话写入守卫）。"""
+        with tx() as conn:
+            conn.execute(
+                "UPDATE snapshot_chunk SET content=?,sha256=? "
+                "WHERE package_id=? AND seq=?",
+                (raws[seq], ss.sha256_hex(raws[seq]), pid, seq))
+
+    # ---- 1) 首次拒绝 + 拒绝响应重放（连续点击/网络重试不绕过首次判定）
+    def test_first_rejection_is_replayed_forever(self):
+        with self._frozen_ready_with_corrupt_chunk() as (pkg, pid, raws):
+            body = {"request_key": "k-ro-1", "version": 2, "actor": "alice",
+                    "ttl_minutes": 30, "as_of": T1}
+            # 首次：重验发现分块 1 损坏 → REOPEN_MISMATCH，保持冻结
+            with pytest.raises(ss.ReopenMismatch) as ei:
+                with tx() as conn:
+                    ss.reopen(conn, pid, body)
+            first_codes = sorted(c["code"] for c in ei.value.conflicts)
+            assert "CHUNK_HASH_MISMATCH" in first_codes
+            bad = [c for c in ei.value.conflicts if c.get("seq") == 1 or c.get("id") == 1]
+            assert bad and bad[0]["code"] == "CHUNK_HASH_MISMATCH"
+            with tx() as conn:
+                s = ss.get_session(conn, pid)
+                row = conn.execute(
+                    "SELECT outcome,status_code FROM snapshot_request WHERE request_key=?",
+                    ("k-ro-1",)).fetchone()
+            assert s["status"] == "FROZEN" and s["version_no"] == 2
+            assert s["frozen_reason"] == "REOPEN_MISMATCH"
+            assert row["outcome"] == "REJECTED" and row["status_code"] == 409
+
+            # 后台修复损坏分块：原操作标识的重放仍回放首次拒绝（带首次失配明细）
+            self._repair_chunk(pid, raws)
+            for i in range(5):  # 连续点击/网络层自动重试
+                with pytest.raises(ss.ReplayedDecision) as er:
+                    with tx() as conn:
+                        ss.reopen(conn, pid, body)
+                p = er.value.payload
+                assert p["replayed"] is True
+                assert p["code"] == "REOPEN_MISMATCH"
+                assert sorted(c["code"] for c in p["conflicts"]) == first_codes
+                assert any(c.get("seq") == 1 or c.get("id") == 1 for c in p["conflicts"])
+                assert p["session"]["frozen_reason"] == "REOPEN_MISMATCH"
+
+            # 不产生任何新的状态变更：仍冻结、版本号不增、幂等记录只有一条、
+            # 冻结与 REOPEN_REJECTED 审计各只记一次
+            with tx() as conn:
+                s = ss.get_session(conn, pid)
+                evs = ss.list_events(conn, pid)
+                n_req = conn.execute(
+                    "SELECT COUNT(*) c FROM snapshot_request WHERE request_key=?",
+                    ("k-ro-1",)).fetchone()["c"]
+            assert s["status"] == "FROZEN" and s["version_no"] == 2
+            assert n_req == 1
+            assert sum(1 for e in evs if e["action"] == "REOPEN_REJECTED") == 1
+            assert sum(1 for e in evs if e["action"] == "FREEZE"
+                       and e["detail"].get("reason") == "REOPEN_MISMATCH") == 1
+
+    # ---- 并发：首次判定进行中的同键并发请求（多客户端/双击）全部排队，
+    #      恰好一个首次判定，其余回放——不会产生第二次校验/第二次状态变更
+    def test_concurrent_duplicates_share_single_decision(self):
+        import threading
+        with self._frozen_ready_with_corrupt_chunk() as (pkg, pid, raws):
+            outcomes = []
+            barrier = threading.Barrier(5)
+
+            def attempt(i):
+                body = {"request_key": "k-ro-race", "version": 2,
+                        "actor": "alice", "ttl_minutes": 30, "as_of": T1}
+                barrier.wait()
+                try:
+                    with tx() as conn:
+                        ss.reopen(conn, pid, body)
+                    outcomes.append(("ok", i))
+                except ss.ReopenMismatch:
+                    outcomes.append(("first", i))
+                except ss.ReplayedDecision as e:
+                    outcomes.append(("replay", i, bool(e.payload.get("replayed"))))
+                except Exception as e:  # noqa: BLE001
+                    outcomes.append(("other", i, type(e).__name__))
+
+            threads = [threading.Thread(target=attempt, args=(i,)) for i in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            kinds = [o[0] for o in outcomes]
+            assert kinds.count("first") == 1 and kinds.count("replay") == 4, outcomes
+            assert all(o[2] for o in outcomes if o[0] == "replay")
+            with tx() as conn:
+                evs = ss.list_events(conn, pid)
+            assert sum(1 for e in evs if e["action"] == "REOPEN_REJECTED") == 1
+            assert sum(1 for e in evs if e["action"] == "FREEZE"
+                       and e["detail"].get("reason") == "REOPEN_MISMATCH") == 1
+
+    # ---- 同键携带新版本号（会话已被推进）也不绕过；同键异内容 400
+    def test_replay_takes_precedence_over_version_and_content(self):
+        with self._frozen_ready_with_corrupt_chunk() as (pkg, pid, raws):
+            body = {"request_key": "k-ro-1", "version": 2, "actor": "alice",
+                    "ttl_minutes": 30, "as_of": T1}
+            with pytest.raises(ss.ReopenMismatch):
+                with tx() as conn:
+                    ss.reopen(conn, pid, body)
+            self._repair_chunk(pid, raws)
+            # 换一个会话版本号（模拟客户端已刷新）重放旧标识：依旧回放拒绝，
+            # 不会被当成 VERSION_CONFLICT，也不会重新校验成功
+            with pytest.raises(ss.ReplayedDecision) as er:
+                with tx() as conn:
+                    ss.reopen(conn, pid, {**body, "version": 99})
+            assert er.value.payload["replayed"] is True
+            # 同键不同请求内容 → REQUEST_KEY_CONFLICT（不能借改内容重放）
+            with pytest.raises(ss.SessionError) as ei:
+                with tx() as conn:
+                    ss.reopen(conn, pid, {**body, "ttl_minutes": 60})
+            assert ei.value.code == "REQUEST_KEY_CONFLICT"
+
+    # ---- 2) 修复后：新 request_key + 最新版本号 → 重验通过、解冻成功
+    def test_new_key_after_repair_succeeds(self):
+        with self._frozen_ready_with_corrupt_chunk() as (pkg, pid, raws):
+            body = {"request_key": "k-ro-bad", "version": 2, "actor": "alice",
+                    "ttl_minutes": 30, "as_of": T1}
+            with pytest.raises(ss.ReopenMismatch):
+                with tx() as conn:
+                    ss.reopen(conn, pid, body)
+            # 未修复前，新标识同样被拒（拒绝与 request_key 无关，损坏客观存在）
+            with pytest.raises(ss.ReopenMismatch) as ei:
+                with tx() as conn:
+                    ss.reopen(conn, pid, {**body, "request_key": "k-ro-try2"})
+            assert any(c.get("seq") == 1 or c.get("id") == 1 for c in ei.value.conflicts)
+            # 后台修复后用新标识 + 当前版本号 → 通过
+            self._repair_chunk(pid, raws)
+            with tx() as conn:
+                r = ss.reopen(conn, pid, {
+                    "request_key": "k-ro-ok", "version": 2, "actor": "alice",
+                    "ttl_minutes": 30, "as_of": T1})
+            assert r["replayed"] is False
+            assert r["status"] == "READY" and r["version"] == 3
+            with tx() as conn:
+                s = ss.get_session(conn, pid)
+            assert s["frozen"] == 0 and s["frozen_reason"] is None
+            # 全块齐备且正确：可以终检导入
+            with tx() as conn:
+                out = ss.finalize(conn, pid, actor="alice", as_of=T1)
+            assert out["status"] == "IMPORTED"
+            # 旧被拒标识在导入后重放：仍回放首次拒绝（不返回导入结果、不写状态）
+            with pytest.raises(ss.ReplayedDecision) as er:
+                with tx() as conn:
+                    ss.reopen(conn, pid, body)
+            assert er.value.payload["code"] == "REOPEN_MISMATCH"
+
+    # ---- 3) 过期修订号拦截（新标识也不行；且不消费标识）
+    def test_stale_version_with_new_key_blocked_and_key_not_consumed(self):
+        with self._frozen_ready_with_corrupt_chunk(corrupt=False) as (pkg, pid, raws):
+            # 冻结后版本号 = 2；先让会话被推进到 3（一次成功重开）
+            with tx() as conn:
+                r = ss.reopen(conn, pid, {"request_key": "k-ro-0", "version": 2,
+                                          "actor": "alice", "ttl_minutes": 30,
+                                          "as_of": T1})
+            assert r["version"] == 3
+            # 再冻结（版本 → 4）
+            with tx() as conn:
+                ss.manual_freeze(conn, pid, {"request_key": "k-f2", "version": 3,
+                                             "actor": "alice", "as_of": T1})
+            # 全新标识持旧版本号 → VERSION_CONFLICT，且标识未被消费
+            body = {"request_key": "k-ro-stale", "version": 2, "actor": "alice",
+                    "ttl_minutes": 30, "as_of": T1}
+            with pytest.raises(ss.VersionConflict) as ei:
+                with tx() as conn:
+                    ss.reopen(conn, pid, body)
+            assert ei.value.code == "VERSION_CONFLICT"
+            with tx() as conn:
+                assert conn.execute(
+                    "SELECT COUNT(*) c FROM snapshot_request WHERE request_key=?",
+                    ("k-ro-stale",)).fetchone()["c"] == 0
+            # 同标识改带最新版本号 → 通过版本关（重验），证明未消费
+            with tx() as conn:
+                r2 = ss.reopen(conn, pid, {**body, "version": 4})
+            assert r2["version"] == 5
+
+    # ---- 4) 已完成导入：不可恢复（新标识 SESSION_IMPORTED；旧标识回放拒绝）
+    def test_imported_session_not_recoverable(self):
+        with self._frozen_ready_with_corrupt_chunk() as (pkg, pid, raws):
+            rejected_body = {"request_key": "k-ro-rej", "version": 2,
+                             "actor": "alice", "ttl_minutes": 30, "as_of": T1}
+            with pytest.raises(ss.ReopenMismatch):
+                with tx() as conn:
+                    ss.reopen(conn, pid, rejected_body)
+            self._repair_chunk(pid, raws)
+            with tx() as conn:
+                r = ss.reopen(conn, pid, {**rejected_body, "request_key": "k-ro-fix"})
+            assert r["status"] == "READY"
+            with tx() as conn:
+                assert ss.finalize(conn, pid, actor="alice", as_of=T1)["status"] == "IMPORTED"
+            # 新标识（即使带当前版本号）→ SESSION_IMPORTED
+            with pytest.raises(ss.SessionFrozen) as ei:
+                with tx() as conn:
+                    ss.reopen(conn, pid, {"request_key": "k-ro-after-import",
+                                          "version": 3, "actor": "alice",
+                                          "ttl_minutes": 30, "as_of": T2})
+            assert ei.value.code == "SESSION_IMPORTED"
+            # 旧被拒标识重放：仍回放首次拒绝
+            with pytest.raises(ss.ReplayedDecision) as er:
+                with tx() as conn:
+                    ss.reopen(conn, pid, rejected_body)
+            assert er.value.payload["code"] == "REOPEN_MISMATCH"
+            # 终检本身幂等返回首次导入结果
+            with tx() as conn:
+                out = ss.finalize(conn, pid, actor="anyone", as_of=T2)
+            assert out["status"] == "IMPORTED" and out["replayed"] is True
 
 
 # ================================================================ 已导入保护
@@ -677,6 +949,93 @@ class TestHTTPWindow:
         rep = client.post("/api/snapshots/imports-cleanup",
                           json={"retention_days": 0}).json()
         assert "removed_count" in rep and rep["protected_imported"] >= 0
+
+    def test_reopen_rejection_replay_http(self):
+        """HTTP 全链路：损坏分块 → reopen 409（终局拒绝）→ 同键重放永远 409
+        回放 → 修复后新 key+最新版本成功导入；旧 key 仍 409。"""
+        pkg = make_pkg()
+        m = pkg["manifest"]
+        pid = m["package_id"]
+        # 建会话（无窗口，负责人 alice）并乱序上传全部分块
+        r = client.post("/api/snapshots/imports", json={
+            "manifest": m, "owner": "alice"})
+        assert r.status_code == 200
+        for seq, b64 in reversed(list(enumerate(pkg["chunks"]))):
+            rr = client.put(f"/api/snapshots/imports/{pid}/chunks/{seq}",
+                            data={"data": b64, "actor": "alice"})
+            assert rr.status_code == 200
+        # 人工冻结（version 1 → 2）
+        assert client.post(f"/api/snapshots/imports/{pid}/freeze",
+                           json={"request_key": "f1", "version": 1,
+                                 "actor": "alice"}).status_code == 200
+        # 直接损坏磁盘上的分块 1
+        with tx() as conn:
+            conn.execute(
+                "UPDATE snapshot_chunk SET content=?,sha256=? "
+                "WHERE package_id=? AND seq=1",
+                (b"DISK-CORRUPTED", ss.sha256_hex(b"DISK-CORRUPTED"), pid))
+
+        body = {"request_key": "ro-bad", "version": 2, "actor": "alice",
+                "ttl_minutes": 30}
+        # 首次重开 → 409 REOPEN_MISMATCH（可定位）
+        r1 = client.post(f"/api/snapshots/imports/{pid}/reopen", json=body)
+        assert r1.status_code == 409
+        d1 = r1.json()["detail"]
+        assert d1["code"] == "REOPEN_MISMATCH"
+        assert any(c.get("id") == 1 and c["code"] == "CHUNK_HASH_MISMATCH"
+                   for c in d1["conflicts"])
+        # 连续点击 × 3（同键重放）→ 全部回放首次拒绝：409 + replayed=true，
+        # 失配明细与首次完全一致
+        for _ in range(3):
+            rr = client.post(f"/api/snapshots/imports/{pid}/reopen", json=body)
+            assert rr.status_code == 409
+            dd = rr.json()["detail"]
+            assert dd["replayed"] is True
+            assert dd["code"] == "REOPEN_MISMATCH"
+            assert [c["code"] for c in dd["conflicts"]] == \
+                   [c["code"] for c in d1["conflicts"]]
+        # 审计只记一次 REOPEN_REJECTED
+        evs = client.get(f"/api/snapshots/imports/{pid}/events").json()
+        assert [e["action"] for e in evs].count("REOPEN_REJECTED") == 1
+
+        # 后台修复分块后，旧 key 仍回放首次拒绝（即便带新版本号）
+        with tx() as conn:
+            raw = ss._b64decode(pkg["chunks"][1])
+            conn.execute(
+                "UPDATE snapshot_chunk SET content=?,sha256=? "
+                "WHERE package_id=? AND seq=1",
+                (raw, ss.sha256_hex(raw), pid))
+        rr = client.post(f"/api/snapshots/imports/{pid}/reopen",
+                         json={**body, "version": 99})
+        assert rr.status_code == 409
+        assert rr.json()["detail"]["replayed"] is True
+
+        # 新 key 但过期版本号 → 409 VERSION_CONFLICT
+        rr = client.post(f"/api/snapshots/imports/{pid}/reopen",
+                         json={"request_key": "ro-new", "version": 1,
+                               "actor": "alice", "ttl_minutes": 30})
+        assert rr.status_code == 409
+        assert rr.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+        # 新 key + 最新版本号（仍为 2）→ 200 重验通过、解冻
+        rr = client.post(f"/api/snapshots/imports/{pid}/reopen",
+                         json={"request_key": "ro-ok", "version": 2,
+                               "actor": "alice", "ttl_minutes": 30})
+        assert rr.status_code == 200, rr.text
+        assert rr.json()["status"] == "READY" and rr.json()["version"] == 3
+        # 终检导入成功
+        rf = client.post(f"/api/snapshots/imports/{pid}/finalize",
+                         json={"actor": "alice"})
+        assert rf.status_code == 200 and rf.json()["status"] == "IMPORTED"
+        # 已导入：新 key 重开 → 409 SESSION_IMPORTED；旧被拒 key → 回放 409
+        rr = client.post(f"/api/snapshots/imports/{pid}/reopen",
+                         json={"request_key": "ro-late", "version": 3,
+                               "actor": "alice", "ttl_minutes": 30})
+        assert rr.status_code == 409
+        assert rr.json()["detail"]["code"] == "SESSION_IMPORTED"
+        rr = client.post(f"/api/snapshots/imports/{pid}/reopen", json=body)
+        assert rr.status_code == 409
+        assert rr.json()["detail"]["code"] == "REOPEN_MISMATCH"
 
     def test_imported_session_management_409_http(self):
         pkg = make_pkg()

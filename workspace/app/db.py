@@ -327,12 +327,18 @@ CREATE INDEX IF NOT EXISTS idx_snapevt_pkg ON snapshot_session_event(package_id,
 
 -- 管理动作（移交/续期/冻结/重开）的幂等请求键：
 -- 同一 request_key 重复请求返回首次结果；期望版本号不匹配 → VERSION_CONFLICT。
+-- outcome: ACCEPTED（首次成功，重放返回首次响应）/ REJECTED（首次判定即终局——
+--   如重开重验因分块损坏等失配被拒；后台文件随后修复，原 request_key 的任何重放
+--   仍原样返回这次拒绝，不产生新的状态变更；操作者必须改用**新 request_key 与
+--   最新会话版本号**重新发起校验）。
 CREATE TABLE IF NOT EXISTS snapshot_request (
     request_key TEXT PRIMARY KEY,
     package_id  TEXT NOT NULL,
     action      TEXT NOT NULL,
     expect_version INTEGER NOT NULL,
     fingerprint TEXT NOT NULL,                -- 请求内容指纹（同键不同内容 → 400）
+    outcome     TEXT NOT NULL DEFAULT 'ACCEPTED',
+    status_code INTEGER,                      -- REJECTED 首次拒绝的 HTTP 状态码
     response_json TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
@@ -376,6 +382,15 @@ def init_db():
                 col = ddl.split("ADD COLUMN")[1].strip().split()[0]
                 if col not in scols:
                     conn.execute(ddl)
+        # 幂等请求记录：首次拒绝终局化（老库迁移）
+        rcols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(snapshot_request)")}
+        if rcols and "outcome" not in rcols:
+            conn.execute(
+                "ALTER TABLE snapshot_request ADD COLUMN outcome TEXT NOT NULL DEFAULT 'ACCEPTED'")
+        if rcols and "status_code" not in rcols:
+            conn.execute(
+                "ALTER TABLE snapshot_request ADD COLUMN status_code INTEGER")
         conn.commit()
     finally:
         conn.close()

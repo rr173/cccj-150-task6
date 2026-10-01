@@ -11,7 +11,17 @@ const api = async (path, opts = {}) => {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || r.statusText);
+  if (!r.ok) {
+    // status===0：未拿到任何 HTTP 响应（断网/连接失败），调用方可安全同键重试
+    const det = data.detail;
+    const msg = det == null ? r.statusText
+      : typeof det === "string" ? det
+      : (det.message || JSON.stringify(det));
+    const err = new Error(msg);
+    err.httpStatus = r.status;
+    err.detail = det;
+    throw err;
+  }
   return data;
 };
 const toast = (msg, kind = "") => {
@@ -1064,7 +1074,10 @@ function toLocalInput(iso) {
 }
 
 // =============================================================== 地籍快照交换包
-const snapState = { pkg: null, manifest: null, session: null, sessions: [], events: [] };
+const snapState = { pkg: null, manifest: null, session: null, sessions: [], events: [],
+  // 管理动作进行中（防连续点击/网络重试重复发新操作标识）；各动作"待决操作标识"
+  // 在首次判定返回前被网络重试复用；终局拒绝后必须显式换新标识
+  busy: false, pendingKey: {}, terminalReject: null };
 
 const SNAP_STATUS_TEXT = {
   UPLOADING: "上传中", READY: "待导入", CONFLICT: "冲突",
@@ -1244,10 +1257,7 @@ $("#btn-snap-create").onclick = async () => {
     await selectSnapSession(d.package_id);
     await loadSnapSessions(d.package_id);
   } catch (e) {
-    if (e.message && e.message.startsWith("{")) {
-      try { const x = JSON.parse(e.message);
-        $("#snap-import-out").textContent = "✗ " + fmt(x); } catch { /* ignore */ }
-    }
+    if (e && e.detail) $("#snap-import-out").textContent = "✗ " + fmt(e.detail);
     toast(e.message, "err");
   }
 };
@@ -1257,6 +1267,8 @@ $("#btn-snap-resume").onclick = () => selectSnapSession($("#snap-resume-id").val
 async function selectSnapSession(id) {
   if (!id) return;
   try {
+    snapState.terminalReject = null;   // 切换会话：清掉上一个会话的终局拒绝提示
+    snapState.pendingKey = {};
     snapState.session = await api(`/api/snapshots/imports/${id}`);
     snapState.events = await api(`/api/snapshots/imports/${id}/events`);
     $("#snap-resume-id").value = id;
@@ -1320,19 +1332,39 @@ function snapErrorDetail(r, d) {
   return null;
 }
 
+// 终局拒绝重放（原操作标识首次判定被拒，重放只回放这次拒绝）的界面反馈
+function snapReopenTerminalHint(det) {
+  const mm = (det.conflicts || []).slice(0, 20).map((c) =>
+    `[${c.code}] ${c.entity || ""} ${c.id ?? ""}: ${c.message}`).join("\n");
+  return "⛔ 该操作标识（request_key）的首次重开校验已被拒绝——判定为终局结果。\n" +
+         "即使后台分块/文件已修复，原操作标识也不会再重新校验或产生状态变更。\n" +
+         "请在确认文件已修复后，用【新操作标识重验】（自动携带最新会话版本号）。\n" +
+         (mm ? `\n首次拒绝的失配明细：\n${mm}` : "");
+}
+
 function snapReportError(r, d) {
   const det = snapErrorDetail(r, d);
   if (det) {
     const why = det.reason ? `（${SNAP_FREEZE_TEXT[det.reason] || det.reason}）` : "";
-    toast(`✗ ${det.message || r.status} ${why}`, "err");
-    $("#snap-import-out").textContent = fmt(det);
+    // 终局拒绝重放：醒目标识，提示必须换新操作标识 + 最新版本号
+    if (det.replayed) {
+      toast("⛔ 原操作标识的首次判定被拒：这是终局结果重放，请用「新操作标识重验」", "err");
+      $("#snap-import-out").textContent = snapReopenTerminalHint(det) +
+        `\n\n完整响应：\n${fmt(det)}`;
+      snapState.terminalReject = det;
+    } else {
+      // 首次拒绝：记下本次操作标识，连续点击/网络重试只会回放这条拒绝
+      if (det.code === "REOPEN_MISMATCH") snapState.terminalReject = det;
+      toast(`✗ ${det.message || r.status} ${why}`, "err");
+      $("#snap-import-out").textContent = fmt(det);
+    }
     if (det.session) {
       snapState.session = det.session;
       renderSnapDetail();
     }
-  } else {
-    toast("操作失败：" + ((d && d.detail) || r.status), "err");
+    return;
   }
+  toast("操作失败：" + ((d && d.detail) || r.status), "err");
 }
 
 // ---------------- 终检导入
@@ -1353,32 +1385,67 @@ $("#btn-snap-finalize").onclick = async () => {
         (d.local_conflicts || []).length} 项，数据库原样`, "err");
     }
   } catch (e) {
-    if (e.message && e.message.startsWith("{")) {
-      try { snapReportError({ status: 0 }, { detail: JSON.parse(e.message) }); }
-      catch { toast(e.message, "err"); }
+    if (e && e.detail && typeof e.detail === "object" && e.detail.code) {
+      snapReportError({ status: e.httpStatus || 0 }, { detail: e.detail });
     } else toast(e.message, "err");
     await selectSnapSession(snapState.session.package_id);
   }
 };
 
 // ---------------- 接收窗口：移交 / 续期 / 冻结 / 重开
-async function snapAction(path, body, okMsg) {
+async function snapAction(path, body, okMsg, opts = {}) {
   const s = snapState.session;
   if (!s) return toast("请先载入会话", "err");
+  // 连续点击防护：同一动作判定未返回前，忽略后续点击（不生成新操作标识）
+  if (snapState.busy) return toast("上一操作尚未完成，已忽略重复点击", "");
+  const keyTag = path.toUpperCase();
+  snapState.busy = true;
+  document.body.classList.add("snap-busy");
   try {
-    const d = await api(`/api/snapshots/imports/${s.package_id}/${path}`,
-                        { method: "POST", body });
+    // 待决操作标识的网络重试：request_key 与首次携带的 version 都必须原样复用
+    // （同键不同版本会被服务端拒绝）；只有首次发起/显式换新标识时才拉取
+    // **最新会话版本号**（过期版本会被 VERSION_CONFLICT 拦截）
+    let pending = snapState.pendingKey[keyTag];
+    if (!pending || opts.freshKey) {
+      const cur = await api(`/api/snapshots/imports/${s.package_id}`);
+      snapState.session = cur;
+      if (opts.requireFrozen && !(cur.frozen || cur.status === "FROZEN")) {
+        return toast("会话当前不是冻结状态，无需重开（请刷新会话状态）", "err");
+      }
+      pending = { key: snapReqKey(path.slice(0, 2)), version: cur.version };
+      snapState.pendingKey[keyTag] = pending;
+    }
+    const reqBody = { ...body, version: pending.version, request_key: pending.key };
+    let d;
+    try {
+      d = await api(`/api/snapshots/imports/${s.package_id}/${path}`,
+                    { method: "POST", body: reqBody });
+    } catch (e) {
+      // 拿到了 HTTP 错误响应 = 服务端已作出判定：待决键使命结束。
+      // 终局拒绝后该键再发只会回放（留着也不会绕过）；VERSION_CONFLICT 等
+      // 未消费键的失败，刷新后由重新点击/「新操作标识重验」生成新判定。
+      // 只有真正的**网络中断**（httpStatus===0，无响应）才保留 pending，
+      // 允许同键重试、由服务端按首次判定去重。
+      if (e.httpStatus !== 0) delete snapState.pendingKey[keyTag];
+      throw e;
+    }
+    // 成功/成功重放：该动作的待决标识消费完毕
+    delete snapState.pendingKey[keyTag];
     if (d.replayed) toast("重复请求：幂等返回首次结果", "ok");
     else toast(okMsg, "ok");
     await selectSnapSession(s.package_id);
     await loadSnapSessions(s.package_id);
     return d;
   } catch (e) {
-    if (e.message && e.message.startsWith("{")) {
-      try { snapReportError({ status: 0 }, { detail: JSON.parse(e.message) }); }
-      catch { toast(e.message, "err"); }
+    if (e && e.detail && typeof e.detail === "object" && e.detail.code) {
+      snapReportError({ status: e.httpStatus || 0 }, { detail: e.detail });
+    } else if (e && e.httpStatus === 0) {
+      toast("网络中断，请求未送达：可再次点击，将复用同一操作标识重试", "err");
     } else toast(e.message, "err");
     await selectSnapSession(s.package_id).catch(() => {});
+  } finally {
+    snapState.busy = false;
+    document.body.classList.remove("snap-busy");
   }
 }
 
@@ -1387,42 +1454,33 @@ window.snapHandover = async function () {
   const next = prompt("移交给新负责人（标识）：", "");
   if (!next || !next.trim()) return;
   await snapAction("handover", {
-    new_owner: next.trim(), request_key: snapReqKey("ho"),
-    version: s.version, actor: snapActor(),
+    new_owner: next.trim(), actor: snapActor(),
   }, `✓ 负责人已移交：${s.owner || "（未指定）"} → ${next.trim()}`);
 };
 
 window.snapRenew = async function () {
-  const s = snapState.session;
   const mins = prompt("续期多少分钟？", "1440");
   const ttl = parseFloat(mins);
   if (!Number.isFinite(ttl) || ttl <= 0) return;
   await snapAction("renew", {
-    ttl_minutes: ttl, request_key: snapReqKey("rn"),
-    version: s.version, actor: snapActor(),
+    ttl_minutes: ttl, actor: snapActor(),
   }, `✓ 已续期 ${ttl} 分钟`);
 };
 
 window.snapFreeze = async function () {
-  const s = snapState.session;
   if (!confirm("人工冻结该会话？已验真分块、缺块与冲突将保留，但拒绝继续写入。")) return;
-  await snapAction("freeze", {
-    request_key: snapReqKey("fz"), version: s.version, actor: snapActor(),
-  }, "✓ 会话已人工冻结");
+  await snapAction("freeze", { actor: snapActor() }, "✓ 会话已人工冻结");
 };
 
-window.snapReopen = async function () {
+window.snapReopen = async function (freshKey) {
   const s = snapState.session;
   const mins = prompt("重新开启并给予新的接收窗口（分钟，可填 1440）：", "1440");
   const ttl = parseFloat(mins);
   if (!Number.isFinite(ttl) || ttl <= 0) return;
-  const d = await snapAction("reopen", {
-    request_key: snapReqKey("ro"), version: s.version, actor: snapActor(),
-    ttl_minutes: ttl,
-  }, "✓ 重验通过，会话已重新开启");
-  if (d && d.status) {
-    // 成功
-  }
+  // freshKey=true：原操作标识已被终局拒绝（或操作者主动要求换标识），
+  // 生成新 request_key；否则网络重试/连续点击复用待决标识由 snapAction 处理
+  await snapAction("reopen", { ttl_minutes: ttl, actor: snapActor() },
+    "✓ 重验通过，会话已重新开启", { requireFrozen: true, freshKey: !!freshKey });
 };
 
 // ---------------- 详情渲染（缺块/冲突/来源时间点/新旧版本）
@@ -1477,8 +1535,15 @@ function renderSnapDetail() {
       <button class="secondary" onclick="snapHandover()" ${imported ? "disabled" : ""}>移交负责人</button>
       <button class="secondary" onclick="snapRenew()" ${frozen || imported ? "disabled" : ""}>续期</button>
       <button class="danger" onclick="snapFreeze()" ${frozen || imported ? "disabled" : ""}>人工冻结</button>
-      <button class="primary" onclick="snapReopen()" ${frozen && !imported ? "" : "disabled"}>重开（重验）</button>
+      <button class="primary" onclick="snapReopen(false)" ${frozen && !imported ? "" : "disabled"}>重开（重验）</button>
+      ${frozen && !imported && s.frozen_reason === "REOPEN_MISMATCH"
+        ? `<button class="primary snap-newkey-btn" onclick="snapReopen(true)">新操作标识重验（文件已修复）</button>`
+        : ""}
     </div>
+    ${frozen && s.frozen_reason === "REOPEN_MISMATCH" ? `<div class="hint terminal-note">
+      ⚠ 重开校验曾被拒绝：该拒绝对原操作标识是<b>终局结果</b>——连续点击或网络重试只会
+      重放首次拒绝，不会重新校验；后台文件修复后须点击【新操作标识重验】（自动使用
+      最新会话版本号 v${s.version}）。</div>` : ""}
     ${imported ? `<div class="hint imported-ok">✓ 已导入：不得移交/续期/冻结/重开；保留期清理也不会删除该会话与导入结果。</div>` : ""}`;
 
   if (frozen && s.frozen_detail) {
@@ -1535,6 +1600,7 @@ function renderSnapDetail() {
     CREATE: "创建会话", RESUME_SESSION: "恢复会话", CHUNK_ACCEPTED: "接收分块",
     CHUNK_CONFLICT: "分块内容冲突", WRITE_DENIED: "拒绝写入",
     HANDOVER: "负责人移交", RENEW: "续期", FREEZE: "冻结", REOPEN: "重新开启",
+    REOPEN_REJECTED: "重开校验被拒（终局）",
     FINALIZE_IMPORT: "终检导入", FINALIZE_REJECTED: "终检驳回" };
   html += `<h4>操作审计（${evs.length}）</h4><div class="snap-events">` +
     evs.slice(-30).map((e) => {
@@ -1546,6 +1612,8 @@ function renderSnapDetail() {
       else if (e.action === "CHUNK_ACCEPTED") note = `#${d.seq}`;
       else if (e.action === "WRITE_DENIED") note = d.reason || "";
       else if (e.action === "REOPEN") note = `至 ${(d.valid_until || "").slice(0, 16)}`;
+      else if (e.action === "REOPEN_REJECTED")
+        note = `失配 ${d.mismatch_count ?? ""} 项 · 操作标识 ${d.request_key || ""}`;
       return `<div class="evt evt-${e.action}"><span class="evt-seq">${e.seq}</span>
         <span class="evt-when">${String(e.created_at).slice(5, 19).replace("T", " ")}</span>
         <span class="evt-act">${EV_TEXT[e.action] || e.action}</span>

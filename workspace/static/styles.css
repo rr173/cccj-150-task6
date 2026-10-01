@@ -252,6 +252,16 @@ button.danger:hover { background: #c85546; }
 .snap-actions button { padding: 5px 10px; font-size: 12px; }
 .snap-actions button.danger { background: #5a2c3a; border-color: #a04a5a; color: #ffd9d9; }
 .snap-actions button:disabled { opacity: .4; cursor: not-allowed; }
+.snap-newkey-btn {
+  border-color: #e0a13a; color: #ffdfa6; background: #4a3a1d;
+}
+.snap-newkey-btn:hover { background: #5d4923; }
+.terminal-note {
+  border: 1px solid #a67530; background: rgba(224,161,58,.10); border-radius: 8px;
+  padding: 7px 10px; margin: 6px 0; color: #ffdfa6; line-height: 1.6;
+}
+body.snap-busy { cursor: progress; }
+body.snap-busy .snap-actions button { opacity: .55; }
 .snap-events {
   max-height: 260px; overflow-y: auto; border: 1px solid #2a3a57; border-radius: 8px;
   font-size: 11.5px;

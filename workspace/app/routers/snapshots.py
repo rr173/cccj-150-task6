@@ -17,6 +17,10 @@ router = APIRouter(prefix="/api/snapshots", tags=["snapshots"])
 
 def _raise_session_error(e: ss.SessionError):
     """把会话服务异常映射为带可定位会话视图的 HTTP 错误。"""
+    if isinstance(e, ss.ReplayedDecision):
+        # 原操作标识的重放命中首次终局拒绝：原样回放首次拒绝响应（409 +
+        # replayed=true），不再重新校验
+        raise HTTPException(e.status_code, e.payload)
     raise HTTPException(e.status_code, {
         "message": e.message, "code": e.code,
         **({"reason": e.reason} if isinstance(e, ss.SessionFrozen) else {}),
