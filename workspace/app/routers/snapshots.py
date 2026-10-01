@@ -21,6 +21,7 @@ def _raise_session_error(e: ss.SessionError):
         "message": e.message, "code": e.code,
         **({"reason": e.reason} if isinstance(e, ss.SessionFrozen) else {}),
         **({"conflicts": e.conflicts} if getattr(e, "conflicts", None) else {}),
+        **({"replayed": True} if getattr(e, "replayed", False) else {}),
         **({"session": e.session} if e.session else {})})
 
 
@@ -169,7 +170,12 @@ def freeze(package_id: str, body: SnapshotFreezeIn):
 
 @router.post("/imports/{package_id}/reopen")
 def reopen(package_id: str, body: SnapshotReopenIn):
-    """重新开启：重新核验清单与现存分块，失配保持冻结并返回可定位原因。"""
+    """重新开启：重新核验清单与现存分块，失配保持冻结并返回可定位原因。
+
+    重验拒绝（409 REOPEN_MISMATCH）即消费请求键并永久绑定该拒绝响应：
+    同键重放原样返回首次判定（replayed=true，不重新核验），会话版本号递增；
+    修正分块后须以**新的请求键 + 最新会话版本号**再次校验。
+    """
     try:
         with tx() as conn:
             if not ss.get_session(conn, package_id):

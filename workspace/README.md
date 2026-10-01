@@ -15,7 +15,7 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 运行测试：
 
 ```bash
-python3 -m pytest tests/ -q          # 125 项：业务规则 + HTTP 集成（含二阶段更正、生效计划、快照交换包、接收窗口与移交全场景）
+python3 -m pytest tests/ -q          # 130 项：业务规则 + HTTP 集成（含二阶段更正、生效计划、快照交换包、接收窗口与移交全场景）
 python3 demo_live.py                 # 完整 HTTP 端到端演示（需先启动服务并 seed）
 ```
 
@@ -43,7 +43,7 @@ python3 demo_live.py                 # 完整 HTTP 端到端演示（需先启�
 | 离线同步接口 | `/api/sync/bundle`（底图+基线版本+容差+邻宗）、`/jobs/{id}/media`、`/validate`、`/submit`、`/jobs/{id}` |
 | 按时间点查询 | `GET /api/parcels/{id}?at=ISO` 与 `GET /api/at/{ts}`，半开区间 `[valid_from, valid_to)` |
 | **地籍快照交换包** | `POST /api/snapshots/export`（时间点+最小闭包导出）、`/precheck`（无网络离线预检）、`/imports`（分块乱序/重复/断点续传，全匹配才一次性导入；见下节） |
-| **接收窗口与移交** | 建会话指定负责人/有效期；分块与终检仅当前负责人；到期/人工冻结保留分块缺块冲突但拒绝写入；移交/续期/冻结/重开携带 `request_key` 幂等键 + `version` 会话版本号防并发覆盖；重开重验清单与现存分块（失配保持冻结、可定位）；已导入不可重开/清理；保留期清理；操作审计（见下节） |
+| **接收窗口与移交** | 建会话指定负责人/有效期；分块与终检仅当前负责人；到期/人工冻结保留分块缺块冲突但拒绝写入；移交/续期/冻结/重开携带 `request_key` 幂等键 + `version` 会话版本号防并发覆盖；重开重验清单与现存分块（失配保持冻结、可定位；**拒绝响应与请求键永久绑定**，同键重放不重新核验，再验须新键+最新版本号）；已导入不可重开/清理；保留期清理；操作审计（见下节） |
 
 ## 版本模型
 
@@ -204,9 +204,13 @@ POST /api/snapshots/imports-cleanup         保留期清理（仅冻结超期且
   **续期**只在窗口开启、未冻结期间允许（过期后须先重开）。
 * **重新开启（reopen）前重新核验清单与现存分块**：清单签章 → 现存分块哈希与缺块；
   全块齐备时按**完整终检口径**（载荷/闭包/链/证明/共享边/本地只读）复验。
-  失配 → **保持冻结**（`REOPEN_MISMATCH`），返回 `entity/id/seq` 级可定位原因，
-  版本号不递增、请求键不消费；通过 → 解冻、现存分块决定 UPLOADING/READY、
-  版本号递增，并须给出新窗口（原窗口已过期时必填）。
+  失配 → **保持冻结**（`REOPEN_MISMATCH`），返回 `entity/id/seq` 级可定位原因；
+  **拒绝响应与请求键永久绑定并落库**——同键重放（连续点击/网络重试）原样返回
+  首次拒绝（`replayed=true`），**不重新核验**，后台分块被修正也不能让原操作标识
+  产生新的状态变更；拒绝本身是一次状态变更，**会话版本号递增**（过期修订号被
+  `VERSION_CONFLICT` 拦截）。再次校验必须携带**新的请求键 + 最新会话版本号**。
+  通过 → 解冻、现存分块决定 UPLOADING/READY、版本号递增，
+  并须给出新窗口（原窗口已过期时必填）。
 * **已导入保护**：`IMPORTED` 会话拒绝移交/续期/冻结/重开（409 `SESSION_IMPORTED`），
   终检仅返回首次结果；保留期清理**永不删除**已导入会话及其导入结果。
 * **保留期清理**：`POST /imports-cleanup` 只删除冻结超过 `retention_days`
@@ -287,7 +291,7 @@ app/
     crypto.py        哈希链与 HMAC
   routers/           HTTP 层（含 effect-plans 生效计划、snapshots 快照交换包）
 static/              Canvas 编辑器（index.html / app.js / styles.css）
-tests/               业务规则 + HTTP 集成测试（test_snapshots.py 覆盖交换包导出闭包/离线预检/分块/冲突/幂等全场景；test_snapshot_window.py 覆盖接收窗口/负责人/到期冻结/移交续期版本幂等/重开重验/已导入保护/保留期清理）
+tests/               业务规则 + HTTP 集成测试（test_snapshots.py 覆盖交换包导出闭包/离线预检/分块/冲突/幂等全场景；test_snapshot_window.py 覆盖接收窗口/负责人/到期冻结/移交续期版本幂等/重开重验/重开拒绝去重（拒绝重放·修复后新请求·过期修订号·已导入保护·连续重试）/保留期清理）
 seed.py              演示种子（甲/乙两宗，共享 x=100 边）
 demo_live.py         实时端到端断言脚本
 ```

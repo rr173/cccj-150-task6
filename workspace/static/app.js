@@ -11,7 +11,12 @@ const api = async (path, opts = {}) => {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || r.statusText);
+  if (!r.ok) {
+    const det = data && data.detail;
+    // 结构化错误（会话冲突/冻结/重开拒绝等）序列化为 JSON，交由 snapReportError 渲染
+    throw new Error(det == null ? r.statusText
+      : typeof det === "string" ? det : JSON.stringify(det));
+  }
   return data;
 };
 const toast = (msg, kind = "") => {
@@ -1324,7 +1329,15 @@ function snapReportError(r, d) {
   const det = snapErrorDetail(r, d);
   if (det) {
     const why = det.reason ? `（${SNAP_FREEZE_TEXT[det.reason] || det.reason}）` : "";
-    toast(`✗ ${det.message || r.status} ${why}`, "err");
+    const tips = [];
+    if (det.replayed) tips.push("重复请求：返回首次判定，未重新执行");
+    if (det.code === "REOPEN_MISMATCH" && !det.replayed)
+      tips.push("该请求键已绑定本次拒绝；修正分块后再次「重开」将自动使用新请求键与最新会话版本");
+    if (det.code === "VERSION_CONFLICT")
+      tips.push("会话版本已变化，请刷新后重试");
+    const nConf = (det.conflicts || []).length;
+    if (nConf) tips.push(`可定位冲突 ${nConf} 项（详见输出面板）`);
+    toast(`✗ ${det.message || r.status}${why}${tips.length ? "｜" + tips.join("；") : ""}`, "err");
     $("#snap-import-out").textContent = fmt(det);
     if (det.session) {
       snapState.session = det.session;
@@ -1490,6 +1503,10 @@ function renderSnapDetail() {
         html += `<div class="conflict-line">[${c.code}] ${c.entity || ""} ${c.id ?? ""}: ${escapeHtml(c.message)}</div>`;
       });
     }
+    if (s.frozen_reason === "REOPEN_MISMATCH") {
+      html += `<div class="hint">⛔ 本次重开请求键已永久绑定该拒绝结果：同一请求重放不再重新核验。
+        修正分块/数据后再次点击「重开（重验）」，将自动携带<b>新请求键 + 最新会话版本（v${s.version}）</b>重新校验。</div>`;
+    }
     html += `</div>`;
   }
 
@@ -1542,7 +1559,10 @@ function renderSnapDetail() {
       let note = "";
       if (e.action === "HANDOVER") note = `${d.from_owner || "—"} → ${d.to_owner}`;
       else if (e.action === "RENEW") note = `至 ${(d.to_valid_until || "").slice(0, 16)}`;
-      else if (e.action === "FREEZE") note = d.reason || "";
+      else if (e.action === "FREEZE") {
+        note = SNAP_FREEZE_TEXT[d.reason] || d.reason || "";
+        if (d.mismatch_count) note += `（失配 ${d.mismatch_count} 项）`;
+      }
       else if (e.action === "CHUNK_ACCEPTED") note = `#${d.seq}`;
       else if (e.action === "WRITE_DENIED") note = d.reason || "";
       else if (e.action === "REOPEN") note = `至 ${(d.valid_until || "").slice(0, 16)}`;

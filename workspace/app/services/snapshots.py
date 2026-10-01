@@ -27,7 +27,9 @@
       同键重放返回首次结果；同键异内容 → REQUEST_KEY_CONFLICT；成功动作版本号 +1；
     * 移交在冻结期间也允许（不解除冻结）；续期仅在窗口开启期间允许；
     * **重新开启（reopen）前重新核验清单与现存分块**（全块齐备时含完整终检口径）：
-      失配保持冻结（REOPEN_MISMATCH）并返回可定位原因，版本/请求键不变；
+      失配保持冻结（REOPEN_MISMATCH）并返回可定位原因——**拒绝响应与请求键
+      永久绑定**（同键重放原样返回首次判定，不重新核验）且**会话版本号递增**
+      （旧修订号过期）；再次校验须用新请求键 + 最新版本号；
       通过才解冻续传；已 IMPORTED 的会话不得重开/移交/续期/冻结；
     * /precheck 纯离线（不依赖本地库时）或只读比对本地库，返回可定位条目；
     * /finalize 只有「全部分块 + 清单 + 链 + 引用关系 + 本地版本」全部匹配时，
@@ -68,12 +70,13 @@ class SessionError(Exception):
     status_code = 400
 
     def __init__(self, message: str, *, code: str, session: dict | None = None,
-                 conflicts=None):
+                 conflicts=None, replayed: bool = False):
         super().__init__(message)
         self.message = message
         self.code = code
         self.session = session
         self.conflicts = conflicts
+        self.replayed = replayed  # 幂等重放（返回首次判定，未重新执行）
 
 
 class SessionFrozen(SessionError):
@@ -105,12 +108,16 @@ class VersionConflict(SessionError):
 
 
 class ReopenMismatch(SessionError):
-    """重开重验失败：保持冻结，返回可定位原因。"""
+    """重开重验失败：保持冻结，返回可定位原因。
+
+    拒绝响应已与请求键永久绑定：同键重放（replayed=True）原样返回首次判定，
+    不重新核验——后台文件修正后须以新请求键 + 最新会话版本号再次校验。
+    """
     status_code = 409
 
-    def __init__(self, message, *, conflicts=None, session=None):
+    def __init__(self, message, *, conflicts=None, session=None, replayed=False):
         super().__init__(message, code="REOPEN_MISMATCH",
-                         session=session, conflicts=conflicts)
+                         session=session, conflicts=conflicts, replayed=replayed)
 
 
 # ================================================================ 时间
@@ -1207,8 +1214,9 @@ def _idempotent_begin(conn, package_id, action: str, payload: dict,
     """管理动作的公共前置：幂等重放 / 版本号校验 / 负责人校验。
 
     返回 {"mode":"replay","response": ...}（重复请求）或
-    {"mode":"run","session": s}（首次请求）。失败（版本冲突等）直接抛异常，
-    且**不消费** request_key——客户端可携带新的版本号以同键重试成功。
+    {"mode":"run","session": s}（首次请求）。前置校验失败（版本冲突等）直接抛异常，
+    且**不消费** request_key——客户端可携带新的版本号以同键重试；
+    动作一旦执行出判定（成功，或 REOPEN 重验拒绝）即消费请求键并永久绑定结果。
     """
     key = (payload.get("request_key") or "").strip()
     if not key:
@@ -1277,7 +1285,11 @@ def _idempotent_begin(conn, package_id, action: str, payload: dict,
 
 def _idempotent_commit(conn, package_id, action, payload, *, expect_version: int,
                        fingerprint: str, response: dict, ts: str):
-    """动作成功后持久化幂等结果（与业务更新在同一写事务内）。"""
+    """动作完成（成功或已判定的拒绝）后持久化幂等结果（与业务更新在同一写事务内）。
+
+    一旦落库，request_key 即被消费并永久对应此次响应：同键同内容重放返回
+    首次结果（含首次判定为拒绝的情形），同键异内容 → REQUEST_KEY_CONFLICT。
+    """
     conn.execute(
         "INSERT INTO snapshot_request(request_key,package_id,action,expect_version,"
         "fingerprint,response_json,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -1745,14 +1757,24 @@ def reopen(conn, package_id: str, payload: dict) -> dict:
     """重新开启冻结会话。
 
     先重新核验清单与现存分块（全块齐备时含完整终检口径）：
-    失配 → **保持冻结**（REOPEN_MISMATCH），返回可定位原因，版本号不变、
-    request_key 不消费；通过 → 解冻并按分块状态回到 UPLOADING/READY，
-    会话版本号递增；可携带新的接收窗口（原窗口已过期时必填）。
+    失配 → **保持冻结**（REOPEN_MISMATCH），返回可定位原因；拒绝也是一次
+    状态变更——**拒绝响应与请求键永久绑定并落库**（同键重放原样返回首次判定，
+    不重新核验，后台文件修正也不能让原操作标识产生新的状态变更），
+    **会话版本号递增**（旧修订号随即过期，VERSION_CONFLICT 拦截）；
+    再次校验必须携带**新的请求键 + 最新会话版本号**。
+    通过 → 解冻并按分块状态回到 UPLOADING/READY，会话版本号递增；
+    可携带新的接收窗口（原窗口已过期时必填）。
     """
     ts = ids.as_of(payload.get("as_of"))
     begin = _idempotent_begin(conn, package_id, "REOPEN", payload, now=ts)
     if begin["mode"] == "replay":
-        return begin["response"]
+        resp = begin["response"]
+        if resp.get("outcome") == "REJECTED":
+            # 首次判定为拒绝：永久重放该拒绝响应，不重新核验、不产生新状态变更
+            raise ReopenMismatch(
+                resp["message"], conflicts=resp.get("conflicts") or [],
+                session=resp.get("session"), replayed=True)
+        return resp
     s = begin["session"]
     if not (s["frozen"] or s["status"] == FROZEN):
         raise SessionError(
@@ -1761,17 +1783,29 @@ def reopen(conn, package_id: str, payload: dict) -> dict:
 
     mismatches = reopen_verification(conn, s)
     if mismatches:
-        # 保持冻结：记录可定位原因（不递增版本、不消费 request_key）
+        # 保持冻结：记录可定位原因；拒绝响应与请求键永久绑定（消费请求键），
+        # 版本号递增使旧修订号过期——再次校验须用新请求键 + 最新版本号
         s2 = _freeze_session(
             conn, s, FR_REOPEN,
             "重开重验未通过：保持冻结（清单/现存分块/本地核验失配）",
             {"mismatches": mismatches[:200], "mismatch_count": len(mismatches)},
-            now=ts, actor=payload.get("actor"), bump_version=False)
+            now=ts, actor=payload.get("actor"), bump_version=True)
         pub = _public_session(conn, s2)
+        rejection = {
+            "action": "REOPEN", "outcome": "REJECTED", "code": "REOPEN_MISMATCH",
+            "package_id": package_id,
+            "message": f"重开重验失败：{len(mismatches)} 项失配，会话保持冻结",
+            "conflicts": mismatches,
+            "version": s2["version_no"],
+            "session": pub,
+        }
+        _idempotent_commit(conn, package_id, "REOPEN", payload,
+                           expect_version=s["version_no"],
+                           fingerprint=begin["fingerprint"],
+                           response=rejection, ts=ts)
         _commit_before_raise(conn)
-        raise ReopenMismatch(
-            f"重开重验失败：{len(mismatches)} 项失配，会话保持冻结",
-            conflicts=mismatches, session=pub)
+        raise ReopenMismatch(rejection["message"], conflicts=mismatches,
+                             session=pub)
 
     # 新窗口：显式 > ttl > 原窗口（仍在未来才有效）
     new_until = _resolve_window(payload.get("valid_until"),
